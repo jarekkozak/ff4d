@@ -60,6 +60,7 @@ Greets and have fun with this little goodie...
 
 
 === New option
+
 jaroslaw.kozak68@gmail.com
 
 -rt dropbox mount directory, by default your root application directory is mounted, you can specify
@@ -69,6 +70,10 @@ jaroslaw.kozak68@gmail.com
     ./ffd4d.py -rt /a <mount folder>
 
     then you dropbox "/a" folder will be mounted as a root to your <mount folder>
+
+To run tests create ff4d.config with you access token and run 
+
+python setup.py test
 
 
 
