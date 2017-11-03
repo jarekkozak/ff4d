@@ -57,3 +57,18 @@ You can see all the mighty arguments by showing the help:
 
 Greets and have fun with this little goodie...
 ''Sascha Schmidt''
+
+
+=== New option
+jaroslaw.kozak68@gmail.com
+
+-rt dropbox mount directory, by default your root application directory is mounted, you can specify
+    a application subfolder as a new root for mounted directory
+
+    example:
+    ./ffd4d.py -rt /a <mount folder>
+
+    then you dropbox "/a" folder will be mounted as a root to your <mount folder>
+
+
+

@@ -1,5 +1,5 @@
 #!/usr/bin/python
-
+# -*- coding: utf-8 -*-
 # Copyright (c) 2014 Sascha Schmidt <sascha@schmidt.ps> (author)
 # http://blog.schmidt.ps
 #
@@ -19,797 +19,589 @@
 
 from __future__ import with_statement
 
-import os, sys, pwd, errno, json, argparse, urllib, urllib2, httplib, traceback
-from time import time, mktime, sleep
-from datetime import datetime
-from stat import S_IFDIR, S_IFLNK, S_IFREG
-from fuse import FUSE, FuseOSError, Operations
+import argparse
+import json
+import logging
+import os
+import pwd
+import sys
+import traceback
 from errno import *
+from stat import S_IFDIR, S_IFREG
+from time import time, sleep
+
+from cache import FileHandleCache, ItemCache
+from dbxapi import DbxRequest, DbxAPI
+from dbxobject import FileHandle
+from fuse import FUSE, FuseOSError, Operations
+
+logger = logging.getLogger(__name__)
+rawlogger = logging.getLogger(__name__)
+
 
 ##################################
 # Class: FUSE Dropbox operations #
 ##################################
 class Dropbox(Operations):
-  def __init__(self, apiRequest):
-    self.ar = apiRequest
-    self.cache = {}
-    self.openfh = {}
-    self.runfh = {} 
+    root_folder = None
 
-  #######################################
-  # Wrapper functions around API calls. #
-  #######################################
+    def __init__(self, dbxApi, root_folder=None):
+        self.ar = dbxApi
+        self.cache = ItemCache()
+        self.openfh = FileHandleCache()
+        self.root_folder = root_folder
 
-  # Get Dropbox metadata of path.
-  def dbxMetadata(self, path, mhash=None):
-    args = {'file_limit'         : 25000,
-            'list'               : True,
-            'include_media_info' : False}
+    # Get metadata for a file or folder from the Dropbox API or local cache.
+    # Deep do sprawdzenia
+    def getDropboxMetadata(self, path, deep=False):
+        logger.debug('Get metadata deep:%s, path:%s', deep, path)
+        item = self.cache.get(path)
+        if item is not None:
+            logger.debug('Found cached metadata for: %s', path)
+            # Force deep check in case of directory, expired or deep=True
+            if (item.is_folder and item.is_expired) or (deep == True and not item.has_entries):
+                # Set temporary hash value for directory non-deep cache entry.
+                logger.debug('Metadata directory deepcheck deep:%s, expired:%s, path:%s', deep, item.is_expired, path)
+                self.cache.remove(path)
+                # Get fresh data
+                item = self.ar.list_folder(path)
+                if item.is_error or item.is_deleted:
+                    logging.exception('Error occured(%s) or entry has been deleted(%s) for %s.', item.is_error,
+                                      item.is_deleted, path)
+                    return False
+                logger.debug('Updating local cache for %s', path)
+                # Cache new data.
+                self.cache.add(item)
+            return item
 
-    if mhash != None:
-      args.update({'hash' : mhash})
-
-    result = self.ar.get('https://api.dropbox.com/1/metadata/auto' + path, args)
-    return result
-
-  # Rename a Dropbox file/directory object.
-  def dbxFileMove(self, old, new):
-    args = {'root'      : 'auto', 
-            'from_path' : old,
-            'to_path'   : new}
-    result = self.ar.post('https://api.dropbox.com/1/fileops/move', args)
-    return result
-
-  # Delete a Dropbox file/directory object.
-  def dbxFileDelete(self, path):
-    args = {'root' : 'auto',
-            'path' : path}
-    result = self.ar.post('https://api.dropbox.com/1/fileops/delete', args)
-    return result
-
-  # Create a Dropboy folder.
-  def dbxFileCreateFolder(self, path):
-    args = {'root' : 'auto',
-            'path' : path}
-    result = self.ar.post('https://api.dropbox.com/1/fileops/create_folder', args)
-    return result
-
-  # Upload chunk of data to Dropbox.
-  def dbxChunkedUpload(self, data, upload_id, offset=0):
-    args = {'offset' : offset}
-
-    # Add upload_id if its not the first chunk.
-    if upload_id != "":
-      args.update({'upload_id' : upload_id})
-
-    result = self.ar.post('https://api-content.dropbox.com/1/chunked_upload?' + urllib.urlencode(args), None, None, data)
-    return result
-
-  # Commit chunked upload to Dropbox.
-  def dbxCommitChunkedUpload(self, path, upload_id):
-    args = {'upload_id' : upload_id}
-    result = self.ar.post('https://api-content.dropbox.com/1/commit_chunked_upload/auto' + path, args)
-    return result
-
-  # Get Dropbox filehandle.
-  def dbxFilehandle(self, path, seek=False):
-    seekheader = None
-    if seek != False:
-      seekheader = {'Range' : 'bytes=' + str(seek)}
-    result = self.ar.get('https://api-content.dropbox.com/1/files/auto' + path, None, seekheader, True)
-    return result
-
-
-  #####################
-  # Helper functions. #
-  #####################
-
-  # Get a valid and unique filehandle.
-  def getFH(self, mode='r'):
-    for i in range(1,8193):
-      if i not in self.openfh:
-        self.openfh[i] = {'mode' : mode, 'f' : False, 'lock' : False, 'eoffset': 0}
-        self.runfh[i] = False
-        return i
-    return False
-
-  # Release a filehandle.
-  def releaseFH(self, fh):
-    if fh in self.openfh:
-      self.openfh.pop(fh)
-      self.runfh.pop(fh)
-    else:
-      return False
-
-  # Remove item from cache.
-  def removeFromCache(self, path):
-    if debug == True: appLog('debug', 'Called removeFromCache() Path: ' + path)
-
-    # Check whether this path exists within cache.
-    if path in self.cache:
-      item = self.cache[path]
-
-      # If this is a directory, remove all childs.
-      if item['is_dir'] == True and 'contents' in item:
-        # Remove folder items from cache.
-        if debug == True: appLog('debug', 'Removing childs of path from cache')
-        for tmp in item['contents']:
-          if debug == True: appLog('debug', 'Removing from cache: ' + tmp['path'])
-          if tmp['path'] in self.cache:
-            self.cache.pop(tmp['path'])
-      else:
-        if os.path.dirname(path) in self.cache:
-          if self.cache[os.path.dirname(path)]['is_dir'] == True: 
-            if debug == True: appLog('debug', 'Removing parent path from file in cache')
-            self.cache.pop(os.path.dirname(path))
-      if debug == True: appLog('debug', 'Removing from cache: ' + path)
-      self.cache.pop(path)
-      return True
-    else:
-      if debug == True: appLog('debug', 'Path not in cache: ' + path)
-      return False
-
-  # Get metadata for a file or folder from the Dropbox API or local cache.
-  def getDropboxMetadata(self, path, deep=False):
-    # Metadata exists within cache.
-    if path in self.cache:
-      if debug == True: appLog('debug', 'Found cached metadata for: ' + path)
-      item = self.cache[path]
-
-      # Check whether this is a directory and if there any remote changes.
-      if item['is_dir'] == True and item['cachets']<int(time()) or (deep == True and 'contents' not in item):
-        # Set temporary hash value for directory non-deep cache entry.
-        if deep == True and 'contents' not in item:
-          item['hash'] = '0' 
-        if debug == True: appLog('debug', 'Metadata directory deepcheck: ' + str(deep))
-        if debug == True: appLog('debug', 'Cache expired for: ' + path)
-        if debug == True: appLog('debug', 'cachets: ' + str(item['cachets']) + ' - ' + str(int(time())))
-        if debug == True: appLog('debug', 'Checking for changes on the remote endpoint for folder: ' + path)
+        # No cached data found, do an Dropbox API request to fetch the metadata.
+        logger.debug('No cached metadata for:%s', path)
         try:
-          item = self.dbxMetadata(path, item['hash'])
-          if 'is_deleted' in item and item['is_deleted'] == True:
-            return False
-          if debug == True: appLog('debug', 'Remote endpoint signalizes changes. Updating local cache for folder: ' + path)
-          if debug_raw == True: appLog('debug', 'Data from Dropbox API call: metadata(' + path + ')')
-          if debug_raw == True: appLog('debug', str(item))
+            # If the parent path already exists, this path (file/dir) does not exist.
+            baseEntry = self.cache.get(os.path.dirname(path))
+            if baseEntry is not None and baseEntry.is_folder:
+                logger.debug('Basepath %s exists in cache for:%s', baseEntry.path, path)
+                return False
+            # Get item metadata from dropbox
+            item = self.ar.list_folder(path)
+            logger.debug("List folder for path %s, Item %s:", path, item)
+            # If path does not exists error info is returned or file/older has been deleted
+            if item.is_error or item.is_deleted:
+                return False
+        except Exception as e:
+            # Unexpected situation
+            logger.error('Could not fetch metadata for: %s', path)
+            logger.debug(e, exc_info=True)
+            raise FuseOSError(EREMOTEIO)
+        # Cache metadata if user wants to use the cache.
+        self.cache.add(item)
+        return item
 
-          # Remove outdated data from cache.
-          self.removeFromCache(path)
+    #########################
+    # Filesystem functions. #
+    #########################
 
-          # Cache new data.
-          cachets = int(time())+cache_time
-          item.update({'cachets':cachets})
-          self.cache[path] = item
-          for tmp in item['contents']:
-            if tmp['is_dir'] == False:
-              if 'is_deleted' not in tmp or ('is_deleted' in tmp and tmp['is_deleted'] == False):
-                tmp.update({'cachets':cachets})
-                self.cache[tmp['path']] = tmp
-        except Exception, e:
-          if debug == True: appLog('debug', 'No remote changes detected for folder: ' + path, traceback.format_exc())
-      return item
-    # No cached data found, do an Dropbox API request to fetch the metadata.
-    else:
-      if debug == True: appLog('debug', 'No cached metadata for: ' + path)
-      try:
-        # If the path already exists, this path (file/dir) does not exist.
-        if os.path.dirname(path) in self.cache and 'contents' in self.cache[os.path.dirname(path)]:
-          if debug == True: appLog('debug', 'Basepath exists in cache for: ' + path)
-          return False
+    # Modify path to have full dropbox app path
+    def dbx_root_path(self, path):
+        return os.path.abspath(self.root_folder + path.encode('utf-8'))
 
-        item = self.dbxMetadata(path)
-        if 'is_deleted' in item and item['is_deleted'] == True:
-          return False
-        if debug_raw == True: appLog('debug', 'Data from Dropbox API call: metadata(' + path + ')')
-        if debug_raw == True: appLog('debug', str(item))
-      except Exception, e:
-        appLog('error', 'Could not fetch metadata for: ' + path, traceback.format_exc())
-        if str(e) == 'apiRequest failed. HTTPError: 404':
-          return False
-        else:
-          raise FuseOSError(EREMOTEIO)
+    def mkdir(self, path, mode):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: mkdir() - Path:%s', path)
+        item = self.ar.create_folder(path)
+        if item.is_error:
+            logger.error('Could not create folder: %s ', item.error_summary)
+            raise FuseOSError(EIO)
+        # Remove outdated parent folder data from cache.
+        self.cache.remove(item.parent_path)
+        return 0
 
-      # Cache metadata if user wants to use the cache.
-      cachets = int(time())+cache_time
-      item.update({'cachets':cachets})
-      self.cache[path] = item
-      # Cache files if this item is a file.
-      if item['is_dir'] == True:
-        for tmp in item['contents']:
-          if 'is_deleted' not in tmp or ('is_deleted' in tmp and tmp['is_deleted'] == False):
-            tmp.update({'cachets':cachets})
-            self.cache[tmp['path']] = tmp
-      return item
+    # Remove a directory.
+    def rmdir(self, path):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: rmdir() - Path:%s', path)
+        item = self.ar.delete(path)
+        if item.is_error:
+            logger.error('Could not delete folder:%s', item.error_summary)
+            raise FuseOSError(EIO)
+        # Remove outdated data from cache.
+        self.cache.remove(item.path)
+        self.cache.remove(item.parent_path)
+        return 0
 
-  #########################
-  # Filesystem functions. #
-  #########################
-  def mkdir(self, path, mode):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: mkdir() - Path: ' + path)
-    try:
-      self.dbxFileCreateFolder(path)
-    except Exception, e:
-      appLog('error', 'Could not create folder: ' + path, traceback.format_exc())
-      raise FuseOSError(EIO)
+    # Remove a file.
+    def unlink(self, path):
+        logger.debug('Called: unlink() - Path: %s', path)
+        return self.rmdir(path)
 
-    # Remove outdated data from cache.
-    self.removeFromCache(os.path.dirname(path))
-    return 0
+    # Rename a file or directory.
+    def rename(self, old, new):
+        old = self.dbx_root_path(old)
+        new = self.dbx_root_path(new)
+        logger.debug('Called: rename() - Old:%s New:%s', old, new)
+        item = self.ar.move(old, new)
+        if item.is_error:
+            logger.error('Could not rename object: %s', item.error_summary)
+            raise FuseOSError(EIO)
+        # Remove outdated data from cache.
+        self.cache.remove(old)
+        self.cache.remove(os.path.basename(new))
+        return 0
 
-  # Remove a directory.
-  def rmdir(self, path):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: rmdir() - Path: ' + path)
-    try:
-      self.dbxFileDelete(path)
-    except Exception, e:
-      appLog('error', 'Could not delete folder: ' + path, traceback.format_exc())
-      raise FuseOSError(EIO)
-    if debug == True: appLog('debug', 'Successfully deleted folder: ' + path) 
+    # Open a filehandle.
+    def open(self, path, flags):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: open() - Path:%s Flags:%s', path, flags)
+        # Validate flags.
+        if flags & os.O_APPEND:
+            logger.debug('O_APPEND mode not supported for open()')
+            raise FuseOSError(EOPNOTSUPP)
+        meta = self.getDropboxMetadata(path)
+        if meta == False:
+            logger.debug('Path does not exist:%s', path)
+            raise FuseOSError(EOPNOTSUPP)
 
-    # Remove outdated data from cache.
-    self.removeFromCache(path)
-    self.removeFromCache(os.path.dirname(path))
-    return 0
+        fh = self.openfh.new_fh(mode='r', item=meta)
+        logger.debug('Returning unique filehandle: %s', fh)
+        return fh
 
-  # Remove a file.
-  def unlink(self, path):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: unlink() - Path: ' + path)
+    # Create a file.
+    def create(self, path, mode):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: create() - Path:%s  Mode:%s', path, mode)
+        fh = self.openfh.new_fh(path=path, mode='w')
+        self.cache.add(self.openfh.get_fh(fh).fsentry)
+        logger.debug('Returning unique filehandle: %s', fh)
+        return fh
 
-    # Remove data from cache.
-    self.removeFromCache(path)
+    # Read data from a remote filehandle.
+    def read(self, path, length, offset, fh):
+        path = self.dbx_root_path(path)
+        # Get filehandle
+        remote_file = self.openfh.get_fh(fh)
+        # Wait while this function is not threadable.
+        while remote_file.is_locked:
+            pass
 
-    # Delete file.
-    try:
-      self.dbxFileDelete(path)
-    except Exception, e:
-      appLog('error', 'Could not delete file: ' + path, traceback.format_exc())
-      raise FuseOSError(EIO)
-    if debug == True: appLog('debug', 'Successfully deleted file: ' + path)
+        logger.debug('Called: read() - Path:%s Length: %s Offset: %s  FH: %s', path, length, offset, fh)
+        logger.debug('Expected offset: %s', remote_file.offset)
 
-    return 0
+        if remote_file.fh == False or remote_file.offset != offset:
+            # Remote file has not been eopened yet or eoffset is differ
+            item = self.ar.download(path, offset)
+            if item.is_error:
+                logger.error('Could not open remote file: %s, error:%s', path, item.error_summary)
+                raise FuseOSError(EIO)
+            remote_file.fh = item.file_handle
 
-  # Rename a file or directory.
-  def rename(self, old, new):
-    old = old.encode('utf-8')
-    new = new.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: rename() - Old: ' + old + ' New: ' + new)
-    try:
-      self.dbxFileMove(old, new)
-    except Exception, e:
-      appLog('error', 'Could not rename object: ' + old, traceback.format_exc())
-      raise FuseOSError(EIO)
-    if debug == True: appLog('debug', 'Successfully renamed object: ' + old)
-    if debug_raw == True: appLog('debug', str(result))
-
-    # Remove outdated data from cache.
-    self.removeFromCache(old)
-    return 0
-
-  # Read data from a remote filehandle.
-  def read(self, path, length, offset, fh):
-    path = path.encode('utf-8')
-    # Wait while this function is not threadable.
-    while self.openfh[fh]['lock'] == True:
-      pass
-
-    self.runfh[fh] = True
-    if debug == True: appLog('debug', 'Called: read() - Path: ' + path + ' Length: ' + str(length) + ' Offset: ' + str(offset) + ' FH: ' + str(fh))
-    if debug == True: appLog('debug', 'Excpected offset: ' + str(self.openfh[fh]['eoffset']))
-    if fh in self.openfh:
-      if self.openfh[fh]['f'] == False:
+        rbytes = None
         try:
-          self.openfh[fh]['f'] = self.dbxFilehandle(path, offset)
-        except Exception, e:
-          appLog('error', 'Could not open remote file: ' + path, traceback.format_exc())
-          raise FuseOSError(EIO) 
-      else:
-        if debug == True: appLog('debug', 'FH handle for reading process already opened')
-        if self.openfh[fh]['eoffset'] != offset:
-          if debug == True: appLog('debug', 'Requested offset differs from expected offset. Seeking to: ' + str(offset))
-          self.openfh[fh]['f'] = self.dbxFilehandle(path, offset)
-        pass
+            rbytes = remote_file.fh.read(length)
+            remote_file.offset = offset + len(rbytes)
+        except Exception as e:
+            logger.error('Could not read data from remotefile')
+            logger.error(e, exc_info=True)
+            raise FuseOSError(EIO)
 
-    # Read from FH.
-    rbytes = ''
-    try:
-      rbytes = self.openfh[fh]['f'].read(length)
-    except Exception, e:
-      appLog('error', 'Could not read data from remotefile: ' + path, traceback.format_exc())
-      raise FuseOSError(EIO)
+        logger.debug('Read bytes from remote source: %s', len(rbytes))
+        remote_file.lock = False
+        # remote_file.offset = offset + len(rbytes)
+        return rbytes
 
-    if debug == True: appLog('debug', 'Read bytes from remote source: ' + str(len(rbytes)))
-    self.openfh[fh]['lock'] = False
-    self.runfh[fh] = False
-    self.openfh[fh]['eoffset'] = offset + len(rbytes)
-    return rbytes
-
-  # Write data to a filehandle.
-  def write(self, path, buf, offset, fh):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: write() - Path: ' + path + ' Offset: ' + str(offset) + ' FH: ' + str(fh))
-    try:
-      # Check for the beginning of the file.
-      if fh in self.openfh:
-        if self.openfh[fh]['f'] == False: 
-          if debug == True: appLog('debug', 'Uploading first chunk to Dropbox...')
-          # Check if the write request exceeds the maximum buffer size.
-          if len(buf) >= write_cache or len(buf) < 4096: 
-            if debug == True: appLog('debug', 'Cache exceeds configured write_cache. Uploading...')
-            result = self.dbxChunkedUpload(buf, "", 0)
-            self.openfh[fh]['f'] = {'upload_id':result['upload_id'], 'offset':result['offset'], 'buf':''}
-          else:
-            if debug == True: appLog('debug', 'Buffer does not exceed configured write_cache. Caching...')
-            self.openfh[fh]['f'] = {'upload_id':'', 'offset':0, 'buf':buf}
-          return len(buf) 
+    # Write data to a filehandle.
+    def write(self, path, buf, offset, fh):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: write() - Path: %s Offset:%s FH:%s', path, offset, fh)
+        logger.debug('Buffer size %s', len(buf))
+        remote_file = self.openfh.get_fh(fh)
+        if remote_file == False:
+            raise FuseOSError(EIO)
+        remote_file.buf = buf
+        # Check for the beginning of the file.
+        if remote_file.is_cache_size_exceeded:
+            if remote_file.is_session_open:
+                logger.debug('Cache exceeds configured write_cache. Uploading...')
+            else:
+                logger.debug('Uploading first chunk to Dropbox...')
+            result = self.ar.upload(remote_file)
+            if result.upload_status.is_error:
+                logger.exception('Could not write to remote file: %s', path)
+                raise FuseOSError(EIO)
         else:
-          if debug == True: appLog('debug', 'Uploading another chunk to Dropbox...')
-          if len(buf)+len(self.openfh[fh]['f']['buf']) >= write_cache or len(buf) < 4096:
-            if debug == True: appLog('debug', 'Cache exceeds configured write_cache. Uploading...')
-            result = self.dbxChunkedUpload(self.openfh[fh]['f']['buf']+buf, self.openfh[fh]['f']['upload_id'], self.openfh[fh]['f']['offset'])
-            self.openfh[fh]['f'] = {'upload_id':result['upload_id'], 'offset':result['offset'], 'buf':''}
-          else:
-            if debug == True: appLog('debug', 'Buffer does not exceed configured write_cache. Caching...')
-            self.openfh[fh]['f'].update({'buf':self.openfh[fh]['f']['buf']+buf})
-          return len(buf) 
-      else:
-        raise FuseOSError(EIO) 
-    except Exception, e:
-      appLog('error', 'Could not write to remote file: ' + path, traceback.format_exc())
-      raise FuseOSError(EIO)
+            logger.debug('Buffer does not exceed configured write_cache. Caching...')
+        # return size of written or cached data
+        return len(buf)
 
-  # Open a filehandle.
-  def open(self, path, flags):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: open() - Path: ' + path + ' Flags: ' + str(flags))
+    # Release (close) a filehandle.
+    def release(self, path, fh):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: release() - Path:%s FH%s', path, fh)
+        remote_file = self.openfh.get_fh(fh)
+        if remote_file == False:
+            raise FuseOSError(EIO)
+        #Release handle whatever happens handle is released
+        logger.debug('Released filehandle: ' + str(fh))
+        self.openfh.release_fh(fh)
+        if (remote_file.mode == 'w' and remote_file.buf_size > 0) or remote_file.is_session_open:
+            #Remove from cache
+            self.cache.remove(remote_file.path)
+            try:
+                if remote_file.buf_size > 0:
+                    result = self.ar.upload(remote_file)
+                    if result.upload_status.is_error:
+                        raise Exception()
+                result = self.ar.commit_upload(remote_file)
+                if result.upload_status.is_error:
+                    raise Exception()
+            except Exception as e:
+                self.cache.remove(remote_file.path)
+                logger.exception('Could not write to remote file: %s', path)
+                raise FuseOSError(EIO)
+            logger.debug('Finishing upload to Dropbox')
+        # Remove outdated data from cache if handle was opened for writing.
+        return 0
 
-    # Validate flags.
-    if flags & os.O_APPEND:
-      if debug == True: appLog('debug', 'O_APPEND mode not supported for open()') 
-      raise FuseOSError(EOPNOTSUPP)
+    # Truncate a file to overwrite it.
+    def truncate(self, path, length, fh=None):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: truncate() - Path: ' + path + " Size: " + str(length))
+        return 0
 
-    fh = self.getFH('r')
-    if debug == True: appLog('debug', 'Returning unique filehandle: ' + str(fh))
-    return fh
+    # List the content of a directory.
+    def readdir(self, path, fh):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: readdir() - Path: ' + path)
 
-  # Create a file.
-  def create(self, path, mode):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: create() - Path: ' + path + ' Mode: ' + str(mode))
+        # Fetch folder informations.
+        fusefolder = ['.', '..']
 
-    fh = self.getFH('w')
-    if debug == True: appLog('debug', 'Returning unique filehandle: ' + str(fh))
+        metadata = self.getDropboxMetadata(path, True)
+        if metadata == False:
+            raise FuseOSError(ENOENT)
 
-    now = datetime.now().strftime('%a, %d %b %Y %H:%M:%S +0000')
-    cachedfh = {'bytes':0, 'modified':now, 'path':path, 'is_dir':False}
-    self.cache[path] = cachedfh
+        # Loop through the Dropbox API reply to build fuse structure.
+        for item in metadata.sub_items:
+            # Append entry to fuse foldercontent.
+            folderitem = item.basename
+            fusefolder.append(folderitem)
 
-    return fh
+        logger.debug("fusefolder:" + str(fusefolder))
 
-  # Release (close) a filehandle.
-  def release(self, path, fh):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: release() - Path: ' + path + ' FH: ' + str(fh))
+        # Loop through the folder content.
+        for item in fusefolder:
+            yield item
 
-    # Check to finish Dropbox upload.
-    if type(self.openfh[fh]['f']) is dict and 'upload_id' in self.openfh[fh]['f'] and self.openfh[fh]['f']['upload_id'] != "":
-      # Flush still existing data in buffer.
-      if self.openfh[fh]['f']['buf'] != "":
-        if debug == True: appLog('debug', 'Flushing write buffer to Dropbox')
-        result = self.dbxChunkedUpload(self.openfh[fh]['f']['buf'], self.openfh[fh]['f']['upload_id'], self.openfh[fh]['f']['offset'])
-      if debug == True: appLog('debug', 'Finishing upload to Dropbox')
-      result = self.dbxCommitChunkedUpload(path, self.openfh[fh]['f']['upload_id'])
+    # Get properties for a directory or file.
+    def getattr(self, path, fh=None):
+        path = self.dbx_root_path(path)
 
-    # Remove outdated data from cache if handle was opened for writing.
-    if self.openfh[fh]['mode'] == 'w':
-      self.removeFromCache(os.path.dirname(path))
+        logger.debug('Called: getattr() - Path:%s', path)
 
-    self.releaseFH(fh)
-    if debug == True: appLog('debug', 'Released filehandle: ' + str(fh))
+        # Get userid and groupid for current user.
+        uid = pwd.getpwuid(os.getuid()).pw_uid
+        gid = pwd.getpwuid(os.getuid()).pw_gid
 
-    return 0
+        # Check wether data exists for item.
+        item = self.getDropboxMetadata(path)
+        if item == False:
+            logger.debug("Entry's metadata not found - Path:%s", path)
+            raise FuseOSError(ENOENT)
 
-  # Truncate a file to overwrite it.
-  def truncate(self, path, length, fh=None):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: truncate() - Path: ' + path + " Size: " + str(length))
-    return 0
+        now = int(time())
+        modified = int(item.server_modified)
 
-  # List the content of a directory.
-  def readdir(self, path, fh):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: readdir() - Path: ' + path)
+        if item.is_folder:
+            # Get st_nlink count for directory.
+            properties = dict(
+                st_mode=S_IFDIR | 0755,
+                st_size=item.size,
+                st_ctime=modified,
+                st_mtime=modified,
+                st_atime=now,
+                st_uid=uid,
+                st_gid=gid,
+                st_nlink=2
+            )
+            logger.debug(
+                'Returning properties for directory:%s (%s)', path, properties)
+            return properties
 
-    # Fetch folder informations.
-    fusefolder = ['.', '..']
-    metadata = self.getDropboxMetadata(path, True)
+        # Regular file
+        properties = dict(
+            st_mode=S_IFREG | 0755,
+            st_size=item.size,
+            st_ctime=modified,
+            st_mtime=modified,
+            st_atime=now,
+            st_uid=uid,
+            st_gid=gid,
+            st_nlink=1,
+        )
+        logger.debug('Returning properties for file:%s (%s)', path, properties)
+        return properties
 
-    # Loop through the Dropbox API reply to build fuse structure.
-    for item in metadata['contents']:
-      # Append entry to fuse foldercontent.
-      folderitem = os.path.basename(item['path'])
-      fusefolder.append(folderitem)
+        # Flush filesystem cache. Always true in this case.
 
-    # Loop through the folder content.
-    for item in fusefolder:
-      yield item
+    def fsync(self, path, fdatasync, fh):
+        path = self.dbx_root_path(path)
+        logger.debug('Called: fsync() - Path:%s', path)
 
-  # Get properties for a directory or file.
-  def getattr(self, path, fh=None):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: getattr() - Path: ' + path)
-
-    # Get userid and groupid for current user.
-    uid = pwd.getpwuid(os.getuid()).pw_uid
-    gid = pwd.getpwuid(os.getuid()).pw_gid
-
-    # Get current time.
-    now = int(time())
-
-    # Check wether data exists for item.
-    item = self.getDropboxMetadata(path)
-    if item == False:
-      #raise FuseOSError(ENOENT)
-      raise FuseOSError(ENOENT)
-
-    # Handle last modified times.
-    if 'modified' in item:
-      modified = item['modified']
-      modified = mktime(datetime.strptime(modified, '%a, %d %b %Y %H:%M:%S +0000').timetuple())
-    else:
-      modified = int(now)
-
-    if item['is_dir'] == True: 
-      # Get st_nlink count for directory.
-      properties = dict(
-        st_mode=S_IFDIR | 0755,
-        st_size=0,
-        st_ctime=modified,
-        st_mtime=modified,
-        st_atime=now,
-        st_uid=uid,
-        st_gid=gid,
-        st_nlink=2
-      )
-      if debug == True: appLog('debug', 'Returning properties for directory: ' + path + ' (' + str(properties) + ')')
-      return properties 
-    else:
-      properties = dict(
-        st_mode=S_IFREG | 0755,
-        st_size=item['bytes'],
-        st_ctime=modified,
-        st_mtime=modified,
-        st_atime=now,
-        st_uid=uid,
-        st_gid=gid,
-        st_nlink=1,
-      )
-      if debug == True: appLog('debug', 'Returning properties for file: ' + path + ' (' + str(properties) + ')')
-      return properties 
-
-  # Flush filesystem cache. Always true in this case.
-  def fsync(self, path, fdatasync, fh):
-    path = path.encode('utf-8')
-    if debug == True: appLog('debug', 'Called: fsync() - Path: ' + path)
-
-########################
-# Class: API transport #
-########################
-class apiRequest():
-  def __init__(self):
-    self.headers = None
-    pass
-
-  # Function to handle GET API request.
-  def get(self, url, args=None, argheaders=None, retresp=False):
-    user_agent = "apiRequest/tools.schmidt.ps"
-    headers = {'User-Agent' : user_agent}
-
-    # Add arguments to request string.
-    if args != None and len(args) > 0:
-      url = url + '?' + urllib.urlencode(args)
-
-    # Add additionally given class headers.
-    if self.headers != None:
-      headers.update(self.headers)
-
-    # Add additionally given headers.
-    if argheaders != None:
-      headers.update(argheaders)
-
-    try:
-      req = urllib2.Request(url, None, headers)
-      response = urllib2.urlopen(req)
-
-      # If retresp is TRUE return the raw response object.
-      if retresp == True:
-        return response
-      else: 
-        return json.loads(response.read())
-    except urllib2.HTTPError, e:
-      appLog('error', 'apiRequest failed. HTTPError: ' + str(e.code))
-      raise Exception, 'apiRequest failed. HTTPError: ' + str(e.code)
-    except urllib2.URLError, e:
-      appLog('error', 'apiRequest failed. URLError: ' + str(e.reason))
-      raise Exception, 'apiRequest failed. URLError: ' + str(e.reason)
-    except httplib.HTTPException, e:
-      appLog('error', 'apiRequest failed. HTTPException: ' + traceback.format_exc())
-      raise Exception, 'apiRequest failed. HTTPException: ' + traceback.format_exc()
-    except Exception, e:
-      appLog('error', 'apiRequest failed. Unknown exception: ' + traceback.format_exc())
-      raise Exception, 'apiRequest failed. Unknown exception: ' + traceback.format_exc()
-
-  # Function to handle POST API request.
-  def post(self, url, args=None, argheaders=None, body=None):
-    user_agent = "apiRequest/tools.schmidt.ps"
-    headers = {'User-Agent' : user_agent}
-
-    if args != None:
-      args = urllib.urlencode(args)
-
-    # Add additionally given class headers.
-    if self.headers != None:
-      headers.update(self.headers)
-
-    # Add additionally given headers.
-    if argheaders != None:
-      headers.update(argheaders)
-
-    # Add body if defined. 
-    if args == None and body != None:
-      headers.update({'Content-type' : 'application/octet-stream'})
-      args = body
-      
-    try:
-      req = urllib2.Request(url, args, headers)
-      response = urllib2.urlopen(req)
-      return json.loads(response.read())
-    except urllib2.HTTPError, e:
-      appLog('error', 'apiRequest failed. HTTPError: ' + str(e.code))
-      raise Exception, 'apiRequest failed. HTTPError: ' + str(e.code)
-    except urllib2.URLError, e:
-      appLog('error', 'apiRequest failed. URLError: ' + str(e.reason))
-      raise Exception, 'apiRequest failed. URLError: ' + str(e.reason)
-    except httplib.HTTPException, e:
-      appLog('error', 'apiRequest failed. HTTPException: ' + traceback.format_exc())
-      raise Exception, 'apiRequest failed. HTTPException: ' + traceback.format_exc()
-    except Exception, e:
-      from traceback import print_exc
-      print_exc()
-      appLog('error', 'apiRequest failed. Unknown exception: ' + traceback.format_exc())
-      raise Exception, 'apiRequest failed. Unknown exception: ' + traceback.format_exc()
 
 ###########################
 # Class: API authorization#
 ###########################
 class apiAuth:
-  def __init__(self):
-    self.access_token = False
-    self.apiRequest = apiRequest() 
-    if debug == True: appLog('debug', 'Initialzed apiAuth')
+    def __init__(self):
+        self.access_token = False
+        self.apiRequest = apiRequest()
+        logger.debug('Initialzed apiAuth')
 
-  # Get code for polling.
-  def getCode(self, provider, appkey):
-    if debug == True: appLog('debug', 'Trying to fetch apiAuth code: ' + provider + ' ' + appkey)
-    try:
-      args = {'get_code': '', 'provider': provider, 'appkey': appkey}
-      result = self.apiRequest.get("https://tools.schmidt.ps/authApp", args)
-      data = json.loads(result)
-    except Exception, e:
-      if debug == True: appLog('debug', 'Failed to fetch apiAuth code', traceback.format_exc())
-      return None
+    # Get code for polling.
+    def getCode(self, provider, appkey):
+        logger.debug('Trying to fetch apiAuth code: ' + provider + ' ' + appkey)
+        try:
+            args = {'get_code': '', 'provider': provider, 'appkey': appkey}
+            result = self.apiRequest.get("https://tools.schmidt.ps/authApp", args)
+            data = json.loads(result)
+        except Exception as e:
+            logger.debug('Failed to fetch apiAuth code', traceback.format_exc())
+            return None
 
-    if 'error' in data:
-      if debug == True: appLog('debug', 'Error in reply of apiAuth code-request')
-      return None
+        if 'error' in data:
+            logger.debug('Error in reply of apiAuth code-request')
+            return None
 
-    if debug == True: appLog('debug', 'Got valid apiAuth code: ' + str(data['code']))
-    return data['code']
+        logger.debug('Got valid apiAuth code: ' + str(data['code']))
+        return data['code']
 
-  # Poll code and wait for result.
-  def pollCode(self, code):
-    loop = True
-    print "Waiting for authorization..."
-    while loop == True:
-      args = {'poll_code': code}
-      result = self.apiRequest.get("https://tools.schmidt.ps/authApp", args)
-      data = json.loads(result)
+    # Poll code and wait for result.
+    def pollCode(self, code):
+        loop = True
+        print "Waiting for authorization..."
+        while loop == True:
+            args = {'poll_code': code}
+            result = self.apiRequest.get("https://tools.schmidt.ps/authApp", args)
+            data = json.loads(result)
 
-      if 'error' in data:
+            if 'error' in data:
+                return False
+
+            if data['state'] == 'invalid':
+                return None
+            if data['state'] == 'valid':
+                return data['authkey']
+            sleep(1)
         return False
 
-      if data['state'] == 'invalid':
-        return None
-      if data['state'] == 'valid':
-        return data['authkey']
-      sleep(1)
-    return False
 
 #####################
 # Global functions. #
 #####################
 
-# Log messages to stdout.
-def appLog(mode, text, reason=""):
-  msg = "[" + mode.upper() + "] " + text
-  if reason != "":
-    msg = msg + " (" + reason + ")" 
-  print msg
-
 # Let the user authorize this application.
 def getAccessToken():
-  dropbox_appkey = "fg7v60fm9f5ud7n"
-  sandbox_appkey = "nstd2c6lbyj4z9b"
-  
-  print ""
-  print "Please choose which permission this application will request:"
-  print "Enter 'd' - This application will have access to your whole"
-  print "            Dropbox."
-  print "Enter 's' - This application will just have access to its"
-  print "            own application folder."
-  print ""
-  validinput = False
-  while validinput == False:
-    perm = raw_input("Please enter permission key: ").strip() 
-    if perm.lower() == 'd' or perm.lower() == 's':
-      validinput = True
+    dropbox_appkey = "fg7v60fm9f5ud7n"
+    sandbox_appkey = "nstd2c6lbyj4z9b"
 
-  appkey = ""
-  if perm.lower() == 'd':
-    appkey = "fg7v60fm9f5ud7n"
-  if perm.lower() == 's':
-    appkey = "nstd2c6lbyj4z9b"
-
-  aa = apiAuth()
-  code = aa.getCode('dropbox', appkey)
-  if code is not None:
     print ""
-    print "Please visit http://tools.schmidt.ps/authApp and use the following"
-    print "code to authorize this application: " + str(code)
+    print "Please choose which permission this application will request:"
+    print "Enter 'd' - This application will have access to your whole"
+    print "            Dropbox."
+    print "Enter 's' - This application will just have access to its"
+    print "            own application folder."
     print ""
+    validinput = False
+    while validinput == False:
+        perm = raw_input("Please enter permission key: ").strip()
+        if perm.lower() == 'd' or perm.lower() == 's':
+            validinput = True
 
-    authkey = aa.pollCode(code)
-    if authkey != False and authkey != None:
-      print "Thanks for granting permission\n"
-      return authkey
+    appkey = ""
+    if perm.lower() == 'd':
+        appkey = "fg7v60fm9f5ud7n"
+    if perm.lower() == 's':
+        appkey = "nstd2c6lbyj4z9b"
 
-    if authkey == None:
-      print "Rejected permission"
+    aa = apiAuth()
+    code = aa.getCode('dropbox', appkey)
+    if code is not None:
+        print ""
+        print "Please visit http://tools.schmidt.ps/authApp and use the following"
+        print "code to authorize this application: " + str(code)
+        print ""
 
-    if authkey == False:
-     print "Authorization request expired"
-  else:
-    print "Failed to start authorization process"
+        authkey = aa.pollCode(code)
+        if authkey != False and authkey != None:
+            print "Thanks for granting permission\n"
+            return authkey
 
-  return False
+        if authkey == None:
+            print "Rejected permission"
+
+        if authkey == False:
+            print "Authorization request expired"
+    else:
+        print "Failed to start authorization process"
+
+    return False
+
 
 ##############
 # Main entry #
 ##############
 # Global variables.
-access_token = False
-cache_time = 120 # Seconds
-write_cache = 4194304 # Bytes
+DbxAPI.access_token = False
+ItemCache.cache_time = 120  # Seconds
+FileHandle.write_cache_size = 4194304  # Bytes
 use_cache = False
 allow_other = False
 allow_root = False
 debug = False
 debug_raw = False
 debug_fuse = False
+root_dir = None
+
 if __name__ == '__main__':
-  print '********************************************************'
-  print '* FUSE Filesystem 4 Dropbox                            *'
-  print '*                                                      *'
-  print '* Copyright 2014                                       *'                  
-  print '* Sascha Schmidt <sascha@schmidt.ps>                   *'
-  print '*                                                      *'
-  print '* https://github.com/realriot/ff4d/blob/master/LICENSE *'
-  print '********************************************************'
-  print ''
 
-  parser = argparse.ArgumentParser()
-  parser.add_argument('-d', '--debug', help='Show debug output', action='store_true', default=False)
-  parser.add_argument('-dr', '--debug-raw', help='Show raw debug output', action='store_true', default=False)
-  parser.add_argument('-df', '--debug-fuse', help='Show FUSE debug output', action='store_true', default=False)
+    # logger.setLevel(logging.INFO)
 
-  # Mutual exclusion of arguments. 
-  atgroup = parser.add_mutually_exclusive_group()
-  atgroup.add_argument('-ap', '--access-token-perm', help='Use this access token permanently (will be saved)', default=False)
-  atgroup.add_argument('-at', '--access-token-temp', help='Use this access token only temporarily (will not be saved)', default=False)
+    print('********************************************************')
+    print('* FUSE Filesystem 4 Dropbox                            *')
+    print('*                                                      *')
+    print('* Copyright 2014                                       *')
+    print('* Sascha Schmidt <sascha@schmidt.ps>                   *')
+    print('*                                                      *')
+    print('* https://github.com/realriot/ff4d/blob/master/LICENSE *')
+    print('********************************************************')
+    print('')
 
-  parser.add_argument('-ao', '--allow-other', help='Allow other users to access this FUSE filesystem', action='store_true', default=False)
-  parser.add_argument('-ar', '--allow-root', help='Allow root to access this FUSE filesystem', action='store_true', default=False)
-  parser.add_argument('-ct', '--cache-time', help='Cache Dropbox data for X seconds (120 by default)', default=120, type=int)
-  parser.add_argument('-wc', '--write-cache', help='Cache X bytes (chunk size) before uploading to Dropbox (4 MB by default)', default=4194304, type=int)
-  parser.add_argument('-bg', '--background', help='Pushes FF4D into background', action='store_false', default=True)
-  
-  parser.add_argument('mountpoint', help='Mount point for Dropbox source')
-  args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--debug', help='Show debug output', action='store_true', default=False)
+    parser.add_argument('-dr', '--debug-raw', help='Show raw debug output', action='store_true', default=False)
+    parser.add_argument('-df', '--debug-fuse', help='Show FUSE debug output', action='store_true', default=False)
 
-  # Set variables supplied by commandline.
-  cache_time = args.cache_time
-  write_cache = args.write_cache
-  allow_other = args.allow_other
-  allow_root = args.allow_root
-  debug = args.debug
-  debug_raw = args.debug_raw
-  debug_fuse = args.debug_fuse
+    # Mutual exclusion of arguments.
+    atgroup = parser.add_mutually_exclusive_group()
+    atgroup.add_argument('-ap', '--access-token-perm', help='Use this access token permanently (will be saved)',
+                         default=False)
+    atgroup.add_argument('-at', '--access-token-temp',
+                         help='Use this access token only temporarily (will not be saved)', default=False)
 
-  # Check ranges and values of given arguments.
-  if cache_time < 0:
-    appLog('error', 'Only positive values for cache-time are possible')
-    sys.exit(-1)
-  if write_cache < 4096:
-    appLog('error', 'The minimum write-cache has a size of 4096 Bytes')
-    sys.exit(-1)
+    parser.add_argument('-ao', '--allow-other', help='Allow other users to access this FUSE filesystem',
+                        action='store_true', default=False)
+    parser.add_argument('-ar', '--allow-root', help='Allow root to access this FUSE filesystem', action='store_true',
+                        default=False)
+    parser.add_argument('-ct', '--cache-time', help='Cache Dropbox data for X seconds (120 by default)', default=120,
+                        type=int)
+    parser.add_argument('-wc', '--write-cache',
+                        help='Cache X bytes (chunk size) before uploading to Dropbox (4 MB by default)',
+                        default=4194304, type=int)
 
-  # Check wether the mountpoint is a valid directory.
-  mountpoint = args.mountpoint
-  if not os.path.isdir(mountpoint):
-    appLog('error', 'Given mountpoint is not a directory.')
-    sys.exit(-1)
+    #parser.add_argument('-rt','--root-dir', help='Dropbox directory to be mounted (Default /)',action='store_true',default='')
+    parser.add_argument('-rt', '--root-dir', help='Dropbox app directory to be mounted (default is / app dir)', default='')
 
-  # Check for an existing configuration file.
-  try:
-    scriptpath = os.path.dirname(sys.argv[0])
-    f = open(scriptpath + '/ff4d.config', 'r')
-    access_token = f.readline()
-    if debug == True: appLog('debug', 'Got accesstoken from configuration file: ' + str(access_token))
-  except Exception, e:
-    pass
 
-  # Check wether the user gave an Dropbox access_token as argument.
-  if args.access_token_perm != False:
-    if debug == True: appLog('debug', 'Got permanent accesstoken from command line: ' + args.access_token_perm)
-    access_token = args.access_token_perm
-  if args.access_token_temp != False:
-    if debug == True: appLog('debug', 'Got temporary accesstoken from command line: ' + args.access_token_temp)
-    access_token = args.access_token_temp
+    parser.add_argument('-bg', '--background', help='Pushes FF4D into background', action='store_false', default=True)
 
-  # Check the need to fetch a new access_token.
-  if access_token == False:
-    appLog('info', 'No accesstoken available. Fetching a new one.')
-    access_token = getAccessToken()
-    if debug == True: appLog('debug', 'Got accesstoken from user input: ' + str(access_token))
 
-  # Check wether an access_token exists.
-  if access_token == False:
-    appLog('error', 'No valid accesstoken available. Exiting.')
-    sys.exit(-1)
+    parser.add_argument('mountpoint', help='Mount point for Dropbox source')
 
-  # Validate access_token.
-  ar = apiRequest()
-  account_info = ''
-  try:
-    headers = {'Authorization' : 'Bearer ' + access_token}
-    account_info = ar.get('https://api.dropbox.com/1/account/info', None, headers)
-  except Exception, e:
-    appLog('error', 'Could not talk to Dropbox API.', traceback.format_exc())
-    sys.exit(-1)
-  ar.headers = {'Authorization' : 'Bearer ' + access_token}
+    args = parser.parse_args()
 
-  # Save valid access token to configuration file.
-  if args.access_token_temp == False:
+    # Set variables supplied by commandline.
+    ItemCache.cache_time = args.cache_time
+    FileHandle.write_cache_size = args.write_cache
+    allow_other = args.allow_other
+    allow_root = args.allow_root
+    debug = args.debug
+    debug_raw = args.debug_raw
+    debug_fuse = args.debug_fuse
+
+    # Check ranges and values of given arguments.
+    if ItemCache.cache_time < 0:
+        logger.error('Only positive values for cache-time are possible')
+        sys.exit(-1)
+    if FileHandle.write_cache_size < 4096:
+        logger.error('The minimum write-cache has a size of 4096 Bytes')
+        sys.exit(-1)
+
+    FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
+    if debug:
+        logging.basicConfig(format=FORMAT, level=logging.DEBUG)
+    else:
+        logging.basicConfig(format=FORMAT, level=logging.INFO)
+
+    # Check wether the mountpoint is a valid directory.
+    root_dir = args.root_dir
+    mountpoint = args.mountpoint
+    if not os.path.isdir(mountpoint):
+        logger.error('Given mountpoint is not a directory.')
+        sys.exit(-1)
+
+    # Check for an existing configuration file.
     try:
-      scriptpath = os.path.dirname(sys.argv[0])
-      f = open(scriptpath + '/ff4d.config', 'w')
-      f.write(access_token)
-      f.close()
-      os.chmod(scriptpath + '/ff4d.config', 0600)
-      if debug == True: appLog('debug', 'Wrote accesstoken to configuration file.\n')
-    except Exception, e:
-      appLog('error', 'Could not write configuration file.', traceback.format_exc())
+        scriptpath = os.path.dirname(sys.argv[0])
+        f = open(scriptpath + '/ff4d.config', 'r')
+        access_token = f.readline()
+        logger.debug('Got accesstoken from configuration file: ' + str(access_token))
+    except Exception as e:
+        pass
 
-  # Everything went fine and we're authed against the Dropbox api.
-  print "Welcome " + account_info['display_name']
-  print "Space used: " + str(account_info['quota_info']['normal']/1024/1024/1024) + " GB"
-  print "Space available: " + str(account_info['quota_info']['quota']/1024/1024/1024) + " GB"
-  print ""
-  print "Starting FUSE..."
-  try:
-    FUSE(Dropbox(ar), mountpoint, foreground=args.background, debug=debug_fuse, sync_read=True, allow_other=allow_other, allow_root=allow_root)
-  except Exception, e:
-    appLog('error', 'Failed to start FUSE...', traceback.format_exc())
-    sys.exit(-1)
+    # Check wether the user gave an Dropbox access_token as argument.
+    if args.access_token_perm != False:
+        logger.debug('Got permanent accesstoken from command line: ' + args.access_token_perm)
+        access_token = args.access_token_perm
+    if args.access_token_temp != False:
+        logger.debug('Got temporary accesstoken from command line: ' + args.access_token_temp)
+        access_token = args.access_token_temp
+
+    # Check the need to fetch a new access_token.
+    if access_token == False:
+        logger.info('No accesstoken available. Fetching a new one.')
+        access_token = getAccessToken()
+        logger.debug('Got accesstoken from user input: ' + str(access_token))
+
+    # Check wether an access_token exists.
+    if access_token == False:
+        logger.error('No valid accesstoken available. Exiting.')
+        sys.exit(-1)
+
+    # Validate access_token.
+    DbxRequest.access_token = access_token
+    ar = DbxRequest()
+    account_info = ''
+    try:
+        account_info = ar.post('https://api.dropboxapi.com/2/users/get_current_account', body=json.dumps(None))
+    except Exception as e:
+        logger.error('Could not talk to Dropbox API.')
+        logger.error(e, exc_info=True)
+        sys.exit(-1)
+
+    # Save valid access token to configuration file.
+    if args.access_token_temp == False:
+        try:
+            scriptpath = os.path.dirname(sys.argv[0])
+            f = open(scriptpath + '/ff4d.config', 'w')
+            f.write(access_token)
+            f.close()
+            os.chmod(scriptpath + '/ff4d.config', 0600)
+            logger.debug('Wrote accesstoken to configuration file.\n')
+        except Exception as e:
+            logger.error('Could not write configuration file.')
+            logger.error(e, exc_info=True)
+
+    # Everything went fine and we're authed against the Dropbox api.
+    # print "Welcome " + account_info['name']['display_name']
+    # print "Space used: " + str(account_info['quota_info']['normal'] / 1024 / 1024 / 1024) + " GB"
+    # print "Space available: " + str(account_info['quota_info']['quota'] / 1024 / 1024 / 1024) + " GB"
+    print ""
+    print "Starting FUSE..."
+
+    try:
+        FUSE(Dropbox(DbxAPI(), root_folder=root_dir), mountpoint, foreground=args.background, debug=debug_fuse,
+             sync_read=True,
+             allow_other=allow_other, allow_root=allow_root)
+    except Exception as e:
+        logger.error('Failed to start FUSE...')
+        logger.error(e, exc_info=True)
+        sys.exit(-1)
