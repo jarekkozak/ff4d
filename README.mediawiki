@@ -67,7 +67,7 @@ jaroslaw.kozak68@gmail.com
     
     ./ffd4d.py -rt /a <mount folder>
 
-then you dropbox "/a" folder will be mounted as a root to your <mount folder>
+then your dropbox "/a" folder will be mounted as a root to your "mount folder"
 
 To run tests create ff4d.config with you access token and run 
 
