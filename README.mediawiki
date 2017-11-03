@@ -71,7 +71,7 @@ then you dropbox "/a" folder will be mounted as a root to your <mount folder>
 
 To run tests create ff4d.config with you access token and run 
 
-python setup.py test
+    python setup.py test
 
 
 
